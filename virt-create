@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+
+# Define the dialog exit status codes
+: ${DIALOG_OK=0}
+: ${DIALOG_CANCEL=1}
+: ${DIALOG_HELP=2}
+: ${DIALOG_EXTRA=3}
+: ${DIALOG_ITEM_HELP=4}
+: ${DIALOG_ESC=255}
+
+DIALOG_OPTS=("--keep-tite" "--clear")
+
+echo "[*] enumerating osinfo known types"
+VARIANTS=()
+while read -r variant; do
+	variant=$(echo -n "$variant" | tr -d '\n')
+	name=$(echo $variant | cut -d'|' -f1)
+	description=$(echo $variant | cut -d'|' -f2)
+	VARIANTS=(${VARIANTS[@]} "$name" "$description")
+done <<< $(osinfo-query os | tr -d ' ' | tail +3)
+
+# Prompt the user for an integer input
+# usage: get_int "TITLE" "MESSAGE" "DEFAULT"
+# It will present an error for non-integer arguments and ask again
+# infinitely until a valid input is provided
+function get_int() {
+	if [ "$#" -ne 3 ]; then
+		return 1
+	fi
+
+	# Ask for the memory size
+	while [ 1 ]; do
+		# Request the size
+		input=$(dialog "${DIALOG_OPTS[@]}" --title "$1" \
+			--inputbox "$2" 8 50 $3 \
+			2>&1 1>&3)
+		check_result $?
+
+		# Ensure this is a valid integer
+		if ! [[ $input =~ $NUM_PATTERN ]]; then
+			dialog --title "$1" --msgbox "$input is not an integer!" 5 50
+		else
+			break
+		fi
+	done
+
+	echo $input
+
+	return 0
+}
+
+function check_result() {
+	case $1 in
+		$DIALOG_OK) ;;
+		*)
+			echo "[!] vm creation cancelled!"
+			exit 1
+	esac
+}
+
+# We use this to get the output of a dialog via stdout
+exec 3>&1
+
+NUM_PATTERN='^[0-9]+$'
+TITLE="Create Virtual Machine"
+
+# Use the machine name provided at the command line, or ask for one
+if [ "$#" -ne 1 ]; then
+	VM_NAME=$(dialog "${DIALOG_OPTS[@]}" --title "$TITLE" \
+		--inputbox "Enter a VM Name:" 8 51 \
+		2>&1 1>&3)
+	check_result $?
+else
+	VM_NAME=$1
+fi
+
+# Adjust title for further dialogs
+TITLE="Domain \"$VM_NAME\" Configuration"
+DIALOG_OPTS=(${DIALOG_OPTS[@]} "--backtitle" "$TITLE")
+
+# Ask for integer parameters (memory, cpu, and disk space)
+VM_MEM=$(get_int "Memory Size" "Enter VM Memory (MB):" 1024)
+VM_CPU=$(get_int "Virtual CPU Count" "Enter CPU Count:" 1)
+VM_DISK=$(get_int "Primary Disk Size" "Enter Disk Size (GB):" 16)
+
+# Ask for installation ISO media
+
+while [ 1 ]; do
+	VM_ISO=$(dialog "${DIALOG_OPTS[@]}" --title "Installation Media" \
+		--fselect "$HOME/ISO/" 30 50 2>&1 1>&3)
+	check_result $?
+
+	if [ -f "$VM_ISO" ]; then
+		break
+	else
+		dialog "${DIALOG_OPTS[@]}" --title "Invalid selection!" \
+			--msgbox "$VM_ISO: not a regular file!" 0 0
+	fi
+done
+
+# Ask for default user Password
+VM_PASSWORD=$(dialog "${DIALOG_OPTS[@]}" --title "User Password" \
+	--passwordbox "Enter Password:" 8 50 2>&1 1>&3)
+check_result $?
+
+# Get a list of all networks
+NETWORKS=()
+while read -r network; do
+	name=$(echo $network | cut -d' ' -f1)
+	state=$(echo $network | cut -d' ' -f2)
+	NETWORKS=(${NETWORKS[@]} "$name" "$state")
+done <<< $(virsh net-list --all | tail +3 | tr -s ' ') 
+
+# Ask the user
+VM_NETWORK=$(dialog "${DIALOG_OPTS[@]}" --title "Network Selection" \
+	--menu "Select a network:" 0 0 0 "${NETWORKS[@]}" 2>&1 1>&3)
+check_result $?
+
+# Ask the user which variant to use
+VM_OSVARIANT=$(dialog "${DIALOG_OPTS[@]}" --title "OS Variant Selection" \
+	--menu "Select OS Variant" 0 0 0 "${VARIANTS[@]}" 2>&1 1>&3)
+check_result $?
+
+echo "[*] creating $VM_OSVARIANT vm named $VM_NAME"
+echo -e "\tmemory: ${VM_MEM}MB"
+echo -e "\tcpu: ${VM_CPU} VCPUs"
+echo -e "\tinstallation: ${VM_ISO}"
+echo -e "\tdisk: ${VM_DISK}GB"
+echo -e "\tnetwork: ${VM_NETWORK}"
+
+# Ask to continue (this should be a dialog)
+dialog "${DIALOG_OPTS[@]}" --title "Are you sure?" \
+	--yesno "Continue with VM creation?" 0 0
+check_result $?
+
+# Write password to disk
+VM_PASSWORD_FILE=`mktemp`
+trap "rm -f $VM_PASSWORD_FILE" EXIT
+chmod 600 "$VM_PASSWORD_FILE"
+echo -n "$VM_PASSWORD" > "$VM_PASSWORD_FILE"
+
+# Create the VM
+virt-install -n "$VM_NAME" --memory "$VM_MEM" --vcpus "$VM_CPU" -c "$VM_ISO" \
+	--unattended user-password-file="$VM_PASSWORD_FILE" --os-variant "$VM_OSVARIANT" \
+	--disk "size=$VM_DISK" --network "network=$VM_NETWORK" --graphics spice \
+	--virt-type kvm --video qxl
+
+
